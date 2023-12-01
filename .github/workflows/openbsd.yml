@@ -47,6 +47,7 @@ jobs:
           # implementation modelled after ref: <https://github.com/rust-lang/rustup/pull/2783>
           # * NOTE: All steps need to be run in this block, otherwise, we are operating back on the mac host
           set -e
+          su -
           #
           TEST_USER=tester
           REPO_NAME=${GITHUB_WORKSPACE##*/}
@@ -138,6 +139,7 @@ jobs:
           # implementation modelled after ref: <https://github.com/rust-lang/rustup/pull/2783>
           # * NOTE: All steps need to be run in this block, otherwise, we are operating back on the mac host
           set -e
+          su -
           #
           # We need a file-descriptor file system to test test_ls::test_ls_io_errors
           mount -t fdescfs fdesc /dev/fd
