@@ -58,10 +58,12 @@ jobs:
         api-level: ${{ matrix.api-level }}
         target: ${{ matrix.target }}
         arch: ${{ matrix.arch }}
-        ram-size: 2048M
-        disk-size: 7GB
+        ram-size: 4096M
+        disk-size: 10GB
+        emulator-boot-timeout: 900
         force-avd-creation: true
-        emulator-options: -no-snapshot-load -noaudio -no-boot-anim -camera-back none
+        emulator-options: -no-snapshot-load -gpu -noaudio -no-boot-anim -camera-back none
+        disable-animations: true
         script: |
           util/android-commands.sh init "${{ matrix.arch }}" "${{ matrix.api-level }}" "${{ env.TERMUX }}"
     - name: Save AVD cache
