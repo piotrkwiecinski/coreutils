@@ -41,7 +41,7 @@ jobs:
         sync: rsync
         copyback: false
         # We need jq to run show-utils.sh and bash to use inline shell string replacement
-        prepare:  pkg_add curl jq bash
+        prepare:  pkg_add curl rust jq bash
         run: |
           ## Prepare, build, and test
           set -e
@@ -51,16 +51,13 @@ jobs:
           WORKSPACE_PARENT="/home/runner/work/${REPO_NAME}"
           WORKSPACE="${WORKSPACE_PARENT}/${REPO_NAME}"
           #
-          adduser -n ${TEST_USER} -d /root/ -g wheel -c "Coreutils user to build" -w random
-          chown -R ${TEST_USER}:wheel /root/ "${WORKSPACE_PARENT}"/
+          useradd -mG wheel ${TEST_USER}
           whoami
           #
           # Further work needs to be done in a doas as we are changing users
-          doas -n -u ${TEST_USER} bash << EOF
+          su ${TEST_USER} -c bash << EOF
           set -e
           whoami
-          curl https://sh.rustup.rs -sSf --output rustup.sh
-          sh rustup.sh -y -c rustfmt,clippy --profile=minimal -t stable
           . ${HOME}/.cargo/env
           ## VARs setup
           cd "${WORKSPACE}"
@@ -130,35 +127,30 @@ jobs:
         usesh: true
         sync: rsync
         copyback: false
-        prepare: pkg_add curl gmake
+        prepare: pkg_add curl gmake rust
         run: |
           ## Prepare, build, and test
           set -e
-          su -
           #
           # We need a file-descriptor file system to test test_ls::test_ls_io_errors
-          mount -t fdescfs fdesc /dev/fd
+          mount -t fdesc fdesc /dev/fd
           #
           TEST_USER=tester
           REPO_NAME=${GITHUB_WORKSPACE##*/}
           WORKSPACE_PARENT="/home/runner/work/${REPO_NAME}"
           WORKSPACE="${WORKSPACE_PARENT}/${REPO_NAME}"
           #
-          adduser -n ${TEST_USER} -d /root/ -g wheel -c "Coreutils user to build" -w random
-          # chown -R ${TEST_USER}:wheel /root/ "${WORKSPACE_PARENT}"/
-          chown -R ${TEST_USER}:wheel /root/ "/${WORKSPACE_PARENT}"/
+          adduser -mG wheel ${TEST_USER}
           whoami
           #
           # Further work needs to be done in a doas as we are changing users
-          doas -n -u ${TEST_USER} sh << EOF
+          su ${TEST_USER} -c sh << EOF
           set -e
           whoami
-          curl https://sh.rustup.rs -sSf --output rustup.sh
-          sh rustup.sh -y --profile=minimal
           . $HOME/.cargo/env
           # Install nextest
           mkdir -p ~/.cargo/bin
-          curl -LsSf https://get.nexte.st/latest/freebsd | tar zxf - -C ~/.cargo/bin
+          curl -LsSf https://get.nexte.st/latest/openbsd | tar zxf - -C ~/.cargo/bin
           ## Info
           # environment
           echo "## environment"
