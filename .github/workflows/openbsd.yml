@@ -41,13 +41,10 @@ jobs:
         sync: rsync
         copyback: false
         # We need jq to run show-utils.sh and bash to use inline shell string replacement
-        prepare: pkg_add -I curl sudo jq bash
+        prepare:  pkg_add curl jq bash
         run: |
           ## Prepare, build, and test
-          # implementation modelled after ref: <https://github.com/rust-lang/rustup/pull/2783>
-          # * NOTE: All steps need to be run in this block, otherwise, we are operating back on the mac host
           set -e
-          su -
           #
           TEST_USER=tester
           REPO_NAME=${GITHUB_WORKSPACE##*/}
@@ -58,8 +55,8 @@ jobs:
           chown -R ${TEST_USER}:wheel /root/ "${WORKSPACE_PARENT}"/
           whoami
           #
-          # Further work needs to be done in a sudo as we are changing users
-          sudo -i -u ${TEST_USER} bash << EOF
+          # Further work needs to be done in a doas as we are changing users
+          doas -n -u ${TEST_USER} bash << EOF
           set -e
           whoami
           curl https://sh.rustup.rs -sSf --output rustup.sh
@@ -133,11 +130,9 @@ jobs:
         usesh: true
         sync: rsync
         copyback: false
-        prepare: pkg_add -I curl gmake sudo
+        prepare: pkg_add curl gmake
         run: |
           ## Prepare, build, and test
-          # implementation modelled after ref: <https://github.com/rust-lang/rustup/pull/2783>
-          # * NOTE: All steps need to be run in this block, otherwise, we are operating back on the mac host
           set -e
           su -
           #
@@ -154,8 +149,8 @@ jobs:
           chown -R ${TEST_USER}:wheel /root/ "/${WORKSPACE_PARENT}"/
           whoami
           #
-          # Further work needs to be done in a sudo as we are changing users
-          sudo -i -u ${TEST_USER} sh << EOF
+          # Further work needs to be done in a doas as we are changing users
+          doas -n -u ${TEST_USER} sh << EOF
           set -e
           whoami
           curl https://sh.rustup.rs -sSf --output rustup.sh
