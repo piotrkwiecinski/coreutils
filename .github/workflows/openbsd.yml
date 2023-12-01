@@ -41,7 +41,7 @@ jobs:
         sync: rsync
         copyback: false
         # We need jq to run show-utils.sh and bash to use inline shell string replacement
-        prepare: pkg install -y curl sudo jq bash
+        prepare: pkg_add -I curl sudo jq bash
         run: |
           ## Prepare, build, and test
           # implementation modelled after ref: <https://github.com/rust-lang/rustup/pull/2783>
@@ -132,7 +132,7 @@ jobs:
         usesh: true
         sync: rsync
         copyback: false
-        prepare: pkg install -y curl gmake sudo
+        prepare: pkg_add -I curl gmake sudo
         run: |
           ## Prepare, build, and test
           # implementation modelled after ref: <https://github.com/rust-lang/rustup/pull/2783>
