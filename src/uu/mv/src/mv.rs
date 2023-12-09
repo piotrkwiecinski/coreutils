@@ -21,7 +21,7 @@ use std::os::windows;
 use std::path::{Path, PathBuf};
 use uucore::backup_control::{self, source_is_target_backup};
 use uucore::display::Quotable;
-use uucore::error::{set_exit_code, FromIo, UError, UResult, USimpleError, UUsageError};
+use uucore::error::{set_exit_code, FromIo, UResult, USimpleError, UUsageError};
 use uucore::fs::{are_hardlinks_or_one_way_symlink_to_same_file, are_hardlinks_to_same_file};
 use uucore::update_control;
 // These are exposed for projects (e.g. nushell) that want to create an `Options` value, which
@@ -341,7 +341,7 @@ fn handle_two_paths(source: &Path, target: &Path, opts: &Options) -> UResult<()>
 
     let target_is_dir = target.is_dir();
 
-    if path_ends_with_terminator(target) && !target_is_dir {
+    if path_ends_with_terminator(target) && !target_is_dir && !opts.no_target_dir {
         return Err(MvError::FailedToAccessNotADirectory(target.quote().to_string()).into());
     }
 

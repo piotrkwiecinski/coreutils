@@ -3,7 +3,7 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
-// spell-checker:ignore (ToDO) cpio svgz webm somegroup nlink rmvb xspf tabsize dired subdired dtype
+// spell-checker:ignore (ToDO) somegroup nlink tabsize dired subdired dtype
 
 use clap::{
     builder::{NonEmptyStringValueParser, ValueParser},
@@ -20,7 +20,7 @@ use std::os::windows::fs::MetadataExt;
 use std::{
     cmp::Reverse,
     error::Error,
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     fmt::{Display, Write as FmtWrite},
     fs::{self, DirEntry, FileType, Metadata, ReadDir},
     io::{stdout, BufWriter, ErrorKind, Stdout, Write},
@@ -155,6 +155,7 @@ pub mod options {
     pub static GROUP_DIRECTORIES_FIRST: &str = "group-directories-first";
     pub static ZERO: &str = "zero";
     pub static DIRED: &str = "dired";
+    pub static HYPERLINK: &str = "hyperlink";
 }
 
 const DEFAULT_TERM_WIDTH: u16 = 80;
@@ -418,6 +419,7 @@ pub struct Config {
     group_directories_first: bool,
     line_ending: LineEnding,
     dired: bool,
+    hyperlink: bool,
 }
 
 // Fields that can be removed or added to the long format
@@ -563,6 +565,25 @@ fn extract_color(options: &clap::ArgMatches) -> bool {
             "auto" | "tty" | "if-tty" => std::io::stdout().is_terminal(),
             /* "never" | "no" | "none" | */ _ => false,
         },
+    }
+}
+
+/// Extracts the hyperlink option to use based on the options provided.
+///
+/// # Returns
+///
+/// A boolean representing whether to hyperlink files.
+fn extract_hyperlink(options: &clap::ArgMatches) -> bool {
+    let hyperlink = options
+        .get_one::<String>(options::HYPERLINK)
+        .unwrap()
+        .as_str();
+
+    match hyperlink {
+        "always" | "yes" | "force" => true,
+        "auto" | "tty" | "if-tty" => std::io::stdout().is_terminal(),
+        "never" | "no" | "none" => false,
+        _ => unreachable!("should be handled by clap"),
     }
 }
 
@@ -736,19 +757,18 @@ impl Config {
         }
 
         let sort = extract_sort(options);
-
         let time = extract_time(options);
-
         let mut needs_color = extract_color(options);
+        let hyperlink = extract_hyperlink(options);
 
-        let cmd_line_bs = options.get_one::<String>(options::size::BLOCK_SIZE);
-        let opt_si = cmd_line_bs.is_some()
+        let opt_block_size = options.get_one::<String>(options::size::BLOCK_SIZE);
+        let opt_si = opt_block_size.is_some()
             && options
                 .get_one::<String>(options::size::BLOCK_SIZE)
                 .unwrap()
                 .eq("si")
             || options.get_flag(options::size::SI);
-        let opt_hr = (cmd_line_bs.is_some()
+        let opt_hr = (opt_block_size.is_some()
             && options
                 .get_one::<String>(options::size::BLOCK_SIZE)
                 .unwrap()
@@ -756,9 +776,9 @@ impl Config {
             || options.get_flag(options::size::HUMAN_READABLE);
         let opt_kb = options.get_flag(options::size::KIBIBYTES);
 
-        let bs_env_var = std::env::var_os("BLOCK_SIZE");
-        let ls_bs_env_var = std::env::var_os("LS_BLOCK_SIZE");
-        let pc_env_var = std::env::var_os("POSIXLY_CORRECT");
+        let env_var_block_size = std::env::var_os("BLOCK_SIZE");
+        let env_var_ls_block_size = std::env::var_os("LS_BLOCK_SIZE");
+        let env_var_posixly_correct = std::env::var_os("POSIXLY_CORRECT");
 
         let size_format = if opt_si {
             SizeFormat::Decimal
@@ -768,13 +788,13 @@ impl Config {
             SizeFormat::Bytes
         };
 
-        let raw_bs = if let Some(cmd_line_bs) = cmd_line_bs {
-            OsString::from(cmd_line_bs)
+        let raw_block_size = if let Some(opt_block_size) = opt_block_size {
+            OsString::from(opt_block_size)
         } else if !opt_kb {
-            if let Some(ls_bs_env_var) = ls_bs_env_var {
-                ls_bs_env_var
-            } else if let Some(bs_env_var) = bs_env_var {
-                bs_env_var
+            if let Some(env_var_ls_block_size) = env_var_ls_block_size {
+                env_var_ls_block_size
+            } else if let Some(env_var_block_size) = env_var_block_size {
+                env_var_block_size
             } else {
                 OsString::from("")
             }
@@ -782,20 +802,18 @@ impl Config {
             OsString::from("")
         };
 
-        let block_size: Option<u64> = if !opt_si && !opt_hr && !raw_bs.is_empty() {
-            match parse_size_u64(&raw_bs.to_string_lossy()) {
+        let block_size: Option<u64> = if !opt_si && !opt_hr && !raw_block_size.is_empty() {
+            match parse_size_u64(&raw_block_size.to_string_lossy()) {
                 Ok(size) => Some(size),
                 Err(_) => {
-                    show!(LsError::BlockSizeParseError(cmd_line_bs.unwrap().clone()));
+                    show!(LsError::BlockSizeParseError(
+                        opt_block_size.unwrap().clone()
+                    ));
                     None
                 }
             }
-        } else if let Some(pc) = pc_env_var {
-            if pc.as_os_str() == OsStr::new("true") || pc == OsStr::new("1") {
-                Some(POSIXLY_CORRECT_BLOCK_SIZE)
-            } else {
-                None
-            }
+        } else if env_var_posixly_correct.is_some() {
+            Some(POSIXLY_CORRECT_BLOCK_SIZE)
         } else {
             None
         };
@@ -1022,6 +1040,7 @@ impl Config {
             group_directories_first: options.get_flag(options::GROUP_DIRECTORIES_FIRST),
             line_ending: LineEnding::from_zero_flag(options.get_flag(options::ZERO)),
             dired,
+            hyperlink,
         })
     }
 }
@@ -1155,6 +1174,19 @@ pub fn uu_app() -> Command {
                 .short('D')
                 .help("generate output designed for Emacs' dired (Directory Editor) mode")
                 .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new(options::HYPERLINK)
+                .long(options::HYPERLINK)
+                .help("hyperlink file names WHEN")
+                .value_parser([
+                    "always", "yes", "force", "auto", "tty", "if-tty", "never", "no", "none",
+                ])
+                .require_equals(true)
+                .num_args(0..=1)
+                .default_missing_value("always")
+                .default_value("never")
+                .value_name("WHEN"),
         )
         // The next four arguments do not override with the other format
         // options, see the comment in Config::from for the reason.
@@ -2946,7 +2978,6 @@ fn classify_file(path: &PathData, out: &mut BufWriter<Stdout>) -> Option<char> {
 ///
 /// Note that non-unicode sequences in symlink targets are dealt with using
 /// [`std::path::Path::to_string_lossy`].
-#[allow(unused_variables)]
 #[allow(clippy::cognitive_complexity)]
 fn display_file_name(
     path: &PathData,
@@ -2961,6 +2992,18 @@ fn display_file_name(
     // We need to keep track of the width ourselves instead of letting term_grid
     // infer it because the color codes mess up term_grid's width calculation.
     let mut width = name.width();
+
+    if config.hyperlink {
+        let hostname = hostname::get().unwrap_or(OsString::from(""));
+        let hostname = hostname.to_string_lossy();
+
+        let absolute_path = fs::canonicalize(&path.p_buf).unwrap_or_default();
+        let absolute_path = absolute_path.to_string_lossy();
+
+        // TODO encode path
+        // \x1b = ESC, \x07 = BEL
+        name = format!("\x1b]8;;file://{hostname}{absolute_path}\x07{name}\x1b]8;;\x07");
+    }
 
     if let Some(ls_colors) = &config.color {
         let md = path.md(out);
@@ -3228,7 +3271,7 @@ fn calculate_padding_collection(
                 padding_collections.minor = minor_len.max(padding_collections.minor);
                 padding_collections.size = size_len
                     .max(padding_collections.size)
-                    .max(padding_collections.major + padding_collections.minor + 2usize);
+                    .max(padding_collections.major);
             }
         }
     }

@@ -3,39 +3,34 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
-use chrono::prelude::DateTime;
-use chrono::Local;
-use clap::ArgAction;
-use clap::{crate_version, Arg, ArgMatches, Command};
+use chrono::{DateTime, Local};
+use clap::{crate_version, Arg, ArgAction, ArgMatches, Command};
 use glob::Pattern;
 use std::collections::HashSet;
 use std::env;
-use std::fs;
-use std::fs::File;
+use std::error::Error;
+use std::fmt::Display;
 #[cfg(not(windows))]
 use std::fs::Metadata;
-use std::io::BufRead;
-use std::io::BufReader;
-use std::io::Result;
-use std::iter;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 #[cfg(not(windows))]
 use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
-use std::{error::Error, fmt::Display};
 use uucore::display::{print_verbatim, Quotable};
-use uucore::error::FromIo;
-use uucore::error::{set_exit_code, UError, UResult, USimpleError};
+use uucore::error::{FromIo, UError, UResult, USimpleError};
 use uucore::line_ending::LineEnding;
 use uucore::parse_glob;
 use uucore::parse_size::{parse_size_u64, ParseSizeError};
-use uucore::{format_usage, help_about, help_section, help_usage, show, show_error, show_warning};
+use uucore::{format_usage, help_about, help_section, help_usage, show, show_warning};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::HANDLE;
 #[cfg(windows)]
@@ -81,23 +76,47 @@ const USAGE: &str = help_usage!("du.md");
 // TODO: Support Z & Y (currently limited by size of u64)
 const UNITS: [(char, u32); 6] = [('E', 6), ('P', 5), ('T', 4), ('G', 3), ('M', 2), ('K', 1)];
 
-struct Options {
+struct TraversalOptions {
     all: bool,
-    max_depth: Option<usize>,
-    total: bool,
     separate_dirs: bool,
     one_file_system: bool,
     dereference: Deref,
     count_links: bool,
-    inodes: bool,
     verbose: bool,
+    excludes: Vec<Pattern>,
 }
 
-#[derive(PartialEq)]
+struct StatPrinter {
+    total: bool,
+    inodes: bool,
+    max_depth: Option<usize>,
+    threshold: Option<Threshold>,
+    apparent_size: bool,
+    size_format: SizeFormat,
+    time: Option<Time>,
+    time_format: String,
+    line_ending: LineEnding,
+    summarize: bool,
+}
+
+#[derive(PartialEq, Clone)]
 enum Deref {
     All,
     Args(Vec<PathBuf>),
     None,
+}
+
+#[derive(Clone, Copy)]
+enum Time {
+    Accessed,
+    Modified,
+    Created,
+}
+
+#[derive(Clone)]
+enum SizeFormat {
+    Human(u64),
+    BlockSize(u64),
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
@@ -119,7 +138,7 @@ struct Stat {
 }
 
 impl Stat {
-    fn new(path: &Path, options: &Options) -> Result<Self> {
+    fn new(path: &Path, options: &TraversalOptions) -> std::io::Result<Self> {
         // Determine whether to dereference (follow) the symbolic link
         let should_dereference = match &options.dereference {
             Deref::All => true,
@@ -277,39 +296,23 @@ fn read_block_size(s: Option<&str>) -> UResult<u64> {
     }
 }
 
-fn choose_size(matches: &ArgMatches, stat: &Stat) -> u64 {
-    if matches.get_flag(options::INODES) {
-        stat.inodes
-    } else if matches.get_flag(options::APPARENT_SIZE) || matches.get_flag(options::BYTES) {
-        stat.size
-    } else {
-        // The st_blocks field indicates the number of blocks allocated to the file, 512-byte units.
-        // See: http://linux.die.net/man/2/stat
-        stat.blocks * 512
-    }
-}
-
 // this takes `my_stat` to avoid having to stat files multiple times.
-// XXX: this should use the impl Trait return type when it is stabilized
 #[allow(clippy::cognitive_complexity)]
 fn du(
     mut my_stat: Stat,
-    options: &Options,
+    options: &TraversalOptions,
     depth: usize,
     seen_inodes: &mut HashSet<FileInfo>,
-    exclude: &[Pattern],
-) -> Box<dyn DoubleEndedIterator<Item = Stat>> {
-    let mut stats = vec![];
-    let mut futures = vec![];
-
+    print_tx: &mpsc::Sender<UResult<StatPrintInfo>>,
+) -> Result<Stat, Box<mpsc::SendError<UResult<StatPrintInfo>>>> {
     if my_stat.is_dir {
         let read = match fs::read_dir(&my_stat.path) {
             Ok(read) => read,
             Err(e) => {
-                show!(
-                    e.map_err_context(|| format!("cannot read directory {}", my_stat.path.quote()))
-                );
-                return Box::new(iter::once(my_stat));
+                print_tx.send(Err(e.map_err_context(|| {
+                    format!("cannot read directory {}", my_stat.path.quote())
+                })))?;
+                return Ok(my_stat);
             }
         };
 
@@ -319,7 +322,7 @@ fn du(
                     match Stat::new(&entry.path(), options) {
                         Ok(this_stat) => {
                             // We have an exclude list
-                            for pattern in exclude {
+                            for pattern in &options.excludes {
                                 // Look at all patterns with both short and long paths
                                 // if we have 'du foo' but search to exclude 'foo/bar'
                                 // we need the full path
@@ -354,90 +357,42 @@ fn du(
                                         }
                                     }
                                 }
-                                futures.push(du(
-                                    this_stat,
-                                    options,
-                                    depth + 1,
-                                    seen_inodes,
-                                    exclude,
-                                ));
+
+                                let this_stat =
+                                    du(this_stat, options, depth + 1, seen_inodes, print_tx)?;
+
+                                if !options.separate_dirs {
+                                    my_stat.size += this_stat.size;
+                                    my_stat.blocks += this_stat.blocks;
+                                    my_stat.inodes += this_stat.inodes;
+                                }
+                                print_tx.send(Ok(StatPrintInfo {
+                                    stat: this_stat,
+                                    depth: depth + 1,
+                                }))?;
                             } else {
                                 my_stat.size += this_stat.size;
                                 my_stat.blocks += this_stat.blocks;
                                 my_stat.inodes += 1;
                                 if options.all {
-                                    stats.push(this_stat);
+                                    print_tx.send(Ok(StatPrintInfo {
+                                        stat: this_stat,
+                                        depth: depth + 1,
+                                    }))?;
                                 }
                             }
                         }
-                        Err(e) => show!(
-                            e.map_err_context(|| format!("cannot access {}", entry.path().quote()))
-                        ),
+                        Err(e) => print_tx.send(Err(e.map_err_context(|| {
+                            format!("cannot access {}", entry.path().quote())
+                        })))?,
                     }
                 }
-                Err(error) => show_error!("{}", error),
+                Err(error) => print_tx.send(Err(error.into()))?,
             }
         }
     }
 
-    stats.extend(futures.into_iter().flatten().filter(|stat| {
-        if !options.separate_dirs && stat.path.parent().unwrap() == my_stat.path {
-            my_stat.size += stat.size;
-            my_stat.blocks += stat.blocks;
-            my_stat.inodes += stat.inodes;
-        }
-        options
-            .max_depth
-            .map_or(true, |max_depth| depth < max_depth)
-    }));
-    stats.push(my_stat);
-    Box::new(stats.into_iter())
-}
-
-fn convert_size_human(size: u64, multiplier: u64, _block_size: u64) -> String {
-    for &(unit, power) in &UNITS {
-        let limit = multiplier.pow(power);
-        if size >= limit {
-            return format!("{:.1}{}", (size as f64) / (limit as f64), unit);
-        }
-    }
-    if size == 0 {
-        return "0".to_string();
-    }
-    format!("{size}B")
-}
-
-fn convert_size_b(size: u64, _multiplier: u64, _block_size: u64) -> String {
-    format!("{}", ((size as f64) / (1_f64)).ceil())
-}
-
-fn convert_size_k(size: u64, multiplier: u64, _block_size: u64) -> String {
-    format!("{}", ((size as f64) / (multiplier as f64)).ceil())
-}
-
-fn convert_size_m(size: u64, multiplier: u64, _block_size: u64) -> String {
-    format!(
-        "{}",
-        ((size as f64) / ((multiplier * multiplier) as f64)).ceil()
-    )
-}
-
-fn convert_size_other(size: u64, _multiplier: u64, block_size: u64) -> String {
-    format!("{}", ((size as f64) / (block_size as f64)).ceil())
-}
-
-fn get_convert_size_fn(matches: &ArgMatches) -> Box<dyn Fn(u64, u64, u64) -> String> {
-    if matches.get_flag(options::HUMAN_READABLE) || matches.get_flag(options::SI) {
-        Box::new(convert_size_human)
-    } else if matches.get_flag(options::BYTES) {
-        Box::new(convert_size_b)
-    } else if matches.get_flag(options::BLOCK_SIZE_1K) {
-        Box::new(convert_size_k)
-    } else if matches.get_flag(options::BLOCK_SIZE_1M) {
-        Box::new(convert_size_m)
-    } else {
-        Box::new(convert_size_other)
-    }
+    Ok(my_stat)
 }
 
 #[derive(Debug)]
@@ -445,7 +400,7 @@ enum DuError {
     InvalidMaxDepthArg(String),
     SummarizeDepthConflict(String),
     InvalidTimeStyleArg(String),
-    InvalidTimeArg(String),
+    InvalidTimeArg,
     InvalidGlob(String),
 }
 
@@ -471,11 +426,9 @@ Try '{} --help' for more information.",
                 s.quote(),
                 uucore::execution_phrase()
             ),
-            Self::InvalidTimeArg(s) => write!(
+            Self::InvalidTimeArg => write!(
                 f,
-                "Invalid argument {} for --time.
-'birth' and 'creation' arguments are not supported on this platform.",
-                s.quote()
+                "'birth' and 'creation' arguments for --time are not supported on this platform.",
             ),
             Self::InvalidGlob(s) => write!(f, "Invalid exclude syntax: {s}"),
         }
@@ -490,7 +443,7 @@ impl UError for DuError {
             Self::InvalidMaxDepthArg(_)
             | Self::SummarizeDepthConflict(_)
             | Self::InvalidTimeStyleArg(_)
-            | Self::InvalidTimeArg(_)
+            | Self::InvalidTimeArg
             | Self::InvalidGlob(_) => 1,
         }
     }
@@ -532,6 +485,108 @@ fn build_exclude_patterns(matches: &ArgMatches) -> UResult<Vec<Pattern>> {
     Ok(exclude_patterns)
 }
 
+struct StatPrintInfo {
+    stat: Stat,
+    depth: usize,
+}
+
+impl StatPrinter {
+    fn choose_size(&self, stat: &Stat) -> u64 {
+        if self.inodes {
+            stat.inodes
+        } else if self.apparent_size {
+            stat.size
+        } else {
+            // The st_blocks field indicates the number of blocks allocated to the file, 512-byte units.
+            // See: http://linux.die.net/man/2/stat
+            stat.blocks * 512
+        }
+    }
+
+    fn print_stats(&self, rx: &mpsc::Receiver<UResult<StatPrintInfo>>) -> UResult<()> {
+        let mut grand_total = 0;
+        loop {
+            let received = rx.recv();
+
+            match received {
+                Ok(message) => match message {
+                    Ok(stat_info) => {
+                        let size = self.choose_size(&stat_info.stat);
+
+                        if stat_info.depth == 0 {
+                            grand_total += size;
+                        }
+
+                        if !self
+                            .threshold
+                            .map_or(false, |threshold| threshold.should_exclude(size))
+                            && self
+                                .max_depth
+                                .map_or(true, |max_depth| stat_info.depth <= max_depth)
+                            && (!self.summarize || stat_info.depth == 0)
+                        {
+                            self.print_stat(&stat_info.stat, size)?;
+                        }
+                    }
+                    Err(e) => show!(e),
+                },
+                Err(_) => break,
+            }
+        }
+
+        if self.total {
+            print!("{}\ttotal", self.convert_size(grand_total));
+            print!("{}", self.line_ending);
+        }
+
+        Ok(())
+    }
+
+    fn convert_size(&self, size: u64) -> String {
+        if self.inodes {
+            return size.to_string();
+        }
+        match self.size_format {
+            SizeFormat::Human(multiplier) => {
+                if size == 0 {
+                    return "0".to_string();
+                }
+                for &(unit, power) in &UNITS {
+                    let limit = multiplier.pow(power);
+                    if size >= limit {
+                        return format!("{:.1}{}", (size as f64) / (limit as f64), unit);
+                    }
+                }
+                format!("{size}B")
+            }
+            SizeFormat::BlockSize(block_size) => div_ceil(size, block_size).to_string(),
+        }
+    }
+
+    fn print_stat(&self, stat: &Stat, size: u64) -> UResult<()> {
+        if let Some(time) = self.time {
+            let secs = get_time_secs(time, stat)?;
+            let tm = DateTime::<Local>::from(UNIX_EPOCH + Duration::from_secs(secs));
+            let time_str = tm.format(&self.time_format).to_string();
+            print!("{}\t{}\t", self.convert_size(size), time_str);
+        } else {
+            print!("{}\t", self.convert_size(size));
+        }
+
+        print_verbatim(&stat.path).unwrap();
+        print!("{}", self.line_ending);
+
+        Ok(())
+    }
+}
+
+// This can be replaced with u64::div_ceil once it is stabilized.
+// This implementation approach is optimized for when `b` is a constant,
+// particularly a power of two.
+pub fn div_ceil(a: u64, b: u64) -> u64 {
+    (a + b - 1) / b
+}
+
 #[uucore::main]
 #[allow(clippy::cognitive_complexity)]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
@@ -557,10 +612,35 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         None => vec![PathBuf::from(".")],
     };
 
-    let options = Options {
+    let time = matches.contains_id(options::TIME).then(|| {
+        match matches.get_one::<String>(options::TIME).map(AsRef::as_ref) {
+            None | Some("ctime" | "status") => Time::Modified,
+            Some("access" | "atime" | "use") => Time::Accessed,
+            Some("birth" | "creation") => Time::Created,
+            _ => unreachable!("should be caught by clap"),
+        }
+    });
+
+    let size_format = if matches.get_flag(options::HUMAN_READABLE) {
+        SizeFormat::Human(1024)
+    } else if matches.get_flag(options::SI) {
+        SizeFormat::Human(1000)
+    } else if matches.get_flag(options::BYTES) {
+        SizeFormat::BlockSize(1)
+    } else if matches.get_flag(options::BLOCK_SIZE_1K) {
+        SizeFormat::BlockSize(1024)
+    } else if matches.get_flag(options::BLOCK_SIZE_1M) {
+        SizeFormat::BlockSize(1024 * 1024)
+    } else {
+        SizeFormat::BlockSize(read_block_size(
+            matches
+                .get_one::<String>(options::BLOCK_SIZE)
+                .map(AsRef::as_ref),
+        )?)
+    };
+
+    let traversal_options = TraversalOptions {
         all: matches.get_flag(options::ALL),
-        max_depth,
-        total: matches.get_flag(options::TOTAL),
         separate_dirs: matches.get_flag(options::SEPARATE_DIRS),
         one_file_system: matches.get_flag(options::ONE_FILE_SYSTEM),
         dereference: if matches.get_flag(options::DEREFERENCE) {
@@ -572,67 +652,49 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
             Deref::None
         },
         count_links: matches.get_flag(options::COUNT_LINKS),
-        inodes: matches.get_flag(options::INODES),
         verbose: matches.get_flag(options::VERBOSE),
+        excludes: build_exclude_patterns(&matches)?,
     };
 
-    if options.inodes
+    let stat_printer = StatPrinter {
+        max_depth,
+        size_format,
+        summarize,
+        total: matches.get_flag(options::TOTAL),
+        inodes: matches.get_flag(options::INODES),
+        threshold: matches
+            .get_one::<String>(options::THRESHOLD)
+            .map(|s| {
+                Threshold::from_str(s).map_err(|e| {
+                    USimpleError::new(1, format_error_message(&e, s, options::THRESHOLD))
+                })
+            })
+            .transpose()?,
+        apparent_size: matches.get_flag(options::APPARENT_SIZE) || matches.get_flag(options::BYTES),
+        time,
+        time_format: parse_time_style(matches.get_one::<String>("time-style").map(|s| s.as_str()))?
+            .to_string(),
+        line_ending: LineEnding::from_zero_flag(matches.get_flag(options::NULL)),
+    };
+
+    if stat_printer.inodes
         && (matches.get_flag(options::APPARENT_SIZE) || matches.get_flag(options::BYTES))
     {
         show_warning!("options --apparent-size and -b are ineffective with --inodes");
     }
 
-    let block_size = read_block_size(
-        matches
-            .get_one::<String>(options::BLOCK_SIZE)
-            .map(|s| s.as_str()),
-    )?;
+    // Use separate thread to print output, so we can print finished results while computation is still running
+    let (print_tx, rx) = mpsc::channel::<UResult<StatPrintInfo>>();
+    let printing_thread = thread::spawn(move || stat_printer.print_stats(&rx));
 
-    let threshold = match matches.get_one::<String>(options::THRESHOLD) {
-        Some(s) => match Threshold::from_str(s) {
-            Ok(t) => Some(t),
-            Err(e) => {
-                return Err(USimpleError::new(
-                    1,
-                    format_error_message(&e, s, options::THRESHOLD),
-                ))
-            }
-        },
-        None => None,
-    };
-
-    let multiplier: u64 = if matches.get_flag(options::SI) {
-        1000
-    } else {
-        1024
-    };
-
-    let convert_size_fn = get_convert_size_fn(&matches);
-
-    let convert_size = |size: u64| {
-        if options.inodes {
-            size.to_string()
-        } else {
-            convert_size_fn(size, multiplier, block_size)
-        }
-    };
-
-    let time_format_str =
-        parse_time_style(matches.get_one::<String>("time-style").map(|s| s.as_str()))?;
-
-    let line_ending = LineEnding::from_zero_flag(matches.get_flag(options::NULL));
-
-    let excludes = build_exclude_patterns(&matches)?;
-
-    let mut grand_total = 0;
     'loop_file: for path in files {
         // Skip if we don't want to ignore anything
-        if !&excludes.is_empty() {
+        if !&traversal_options.excludes.is_empty() {
             let path_string = path.to_string_lossy();
-            for pattern in &excludes {
+            for pattern in &traversal_options.excludes {
                 if pattern.matches(&path_string) {
                     // if the directory is ignored, leave early
-                    if options.verbose {
+                    if traversal_options.verbose {
                         println!("{} ignored", path_string.quote());
                     }
                     continue 'loop_file;
@@ -641,79 +703,46 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         }
 
         // Check existence of path provided in argument
-        if let Ok(stat) = Stat::new(&path, &options) {
+        if let Ok(stat) = Stat::new(&path, &traversal_options) {
             // Kick off the computation of disk usage from the initial path
             let mut seen_inodes: HashSet<FileInfo> = HashSet::new();
             if let Some(inode) = stat.inode {
                 seen_inodes.insert(inode);
             }
-            let iter = du(stat, &options, 0, &mut seen_inodes, &excludes);
+            let stat = du(stat, &traversal_options, 0, &mut seen_inodes, &print_tx)
+                .map_err(|e| USimpleError::new(1, e.to_string()))?;
 
-            // Sum up all the returned `Stat`s and display results
-            let (_, len) = iter.size_hint();
-            let len = len.unwrap();
-            for (index, stat) in iter.enumerate() {
-                let size = choose_size(&matches, &stat);
-
-                if threshold.map_or(false, |threshold| threshold.should_exclude(size)) {
-                    continue;
-                }
-
-                if matches.contains_id(options::TIME) {
-                    let tm = {
-                        let secs = matches
-                            .get_one::<String>(options::TIME)
-                            .map(|s| get_time_secs(s, &stat))
-                            .transpose()?
-                            .unwrap_or(stat.modified);
-                        DateTime::<Local>::from(UNIX_EPOCH + Duration::from_secs(secs))
-                    };
-                    if !summarize || index == len - 1 {
-                        let time_str = tm.format(time_format_str).to_string();
-                        print!("{}\t{}\t", convert_size(size), time_str);
-                        print_verbatim(stat.path).unwrap();
-                        print!("{line_ending}");
-                    }
-                } else if !summarize || index == len - 1 {
-                    print!("{}\t", convert_size(size));
-                    print_verbatim(stat.path).unwrap();
-                    print!("{line_ending}");
-                }
-                if options.total && index == (len - 1) {
-                    // The last element will be the total size of the the path under
-                    // path_string.  We add it to the grand total.
-                    grand_total += size;
-                }
-            }
+            print_tx
+                .send(Ok(StatPrintInfo { stat, depth: 0 }))
+                .map_err(|e| USimpleError::new(1, e.to_string()))?;
         } else {
-            show_error!(
-                "{}: {}",
-                path.to_string_lossy().maybe_quote(),
-                "No such file or directory"
-            );
-            set_exit_code(1);
+            print_tx
+                .send(Err(USimpleError::new(
+                    1,
+                    format!(
+                        "{}: No such file or directory",
+                        path.to_string_lossy().maybe_quote()
+                    ),
+                )))
+                .map_err(|e| USimpleError::new(1, e.to_string()))?;
         }
     }
 
-    if options.total {
-        print!("{}\ttotal", convert_size(grand_total));
-        print!("{line_ending}");
-    }
+    drop(print_tx);
+
+    printing_thread
+        .join()
+        .map_err(|_| USimpleError::new(1, "Printing thread panicked."))??;
 
     Ok(())
 }
 
-fn get_time_secs(s: &str, stat: &Stat) -> std::result::Result<u64, DuError> {
-    let secs = match s {
-        "ctime" | "status" => stat.modified,
-        "access" | "atime" | "use" => stat.accessed,
-        "birth" | "creation" => stat
-            .created
-            .ok_or_else(|| DuError::InvalidTimeArg(s.into()))?,
-        // below should never happen as clap already restricts the values.
-        _ => unreachable!("Invalid field for --time"),
-    };
-    Ok(secs)
+fn get_time_secs(time: Time, stat: &Stat) -> Result<u64, DuError> {
+    match time {
+        Time::Modified => Ok(stat.modified),
+        Time::Accessed => Ok(stat.accessed),
+        Time::Created => stat.created.ok_or(DuError::InvalidTimeArg),
+    }
 }
 
 fn parse_time_style(s: Option<&str>) -> UResult<&str> {
@@ -966,7 +995,7 @@ enum Threshold {
 impl FromStr for Threshold {
     type Err = ParseSizeError;
 
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         let offset = usize::from(s.starts_with(&['-', '+'][..]));
 
         let size = parse_size_u64(&s[offset..])?;

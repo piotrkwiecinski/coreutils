@@ -994,9 +994,9 @@ fn test_ls_long() {
 fn test_ls_long_format() {
     let scene = TestScenario::new(util_name!());
     let at = &scene.fixtures;
-    at.mkdir(&at.plus_as_string("test-long-dir"));
+    at.mkdir(at.plus_as_string("test-long-dir"));
     at.touch(at.plus_as_string("test-long-dir/test-long-file"));
-    at.mkdir(&at.plus_as_string("test-long-dir/test-long-dir"));
+    at.mkdir(at.plus_as_string("test-long-dir/test-long-dir"));
 
     for arg in LONG_ARGS {
         // Assuming sane username do not have spaces within them.
@@ -1021,6 +1021,21 @@ fn test_ls_long_format() {
     scene.ucmd().arg("-lan").arg("test-long-dir").succeeds().stdout_matches(&Regex::new(
         r"\nd([r-][w-][xt-]){3}\.? +\d+ \d+ +\d+( +\d+)? +\d+ [A-Z][a-z]{2} {0,2}\d{0,2} {0,2}[0-9:]+ \.\."
     ).unwrap());
+}
+
+#[test]
+fn test_ls_long_padding_of_size_column_with_multiple_files() {
+    let (at, mut ucmd) = at_and_ucmd!();
+
+    at.mkdir("dir");
+    at.touch("dir/a");
+    at.touch("dir/b");
+
+    ucmd.arg("-l")
+        .arg("dir")
+        .succeeds()
+        .stdout_contains(" 0 ")
+        .stdout_does_not_contain("  0 ");
 }
 
 /// This test tests `ls -laR --color`.
@@ -1971,7 +1986,7 @@ fn test_ls_color() {
         .join("nested_dir")
         .to_string_lossy()
         .to_string();
-    at.mkdir(&nested_dir);
+    at.mkdir(nested_dir);
     at.mkdir("z");
     let nested_file = Path::new("a")
         .join("nested_file")
@@ -3812,4 +3827,61 @@ fn test_ls_cf_output_should_be_delimited_by_tab() {
     ucmd.args(&["-CF", "e"])
         .succeeds()
         .stdout_is("a2345/\tb/\n");
+}
+
+#[cfg(all(unix, feature = "dd"))]
+#[test]
+fn test_posixly_correct() {
+    let scene = TestScenario::new(util_name!());
+
+    scene
+        .ccmd("dd")
+        .arg("if=/dev/zero")
+        .arg("of=file")
+        .arg("bs=1024")
+        .arg("count=1")
+        .succeeds();
+
+    scene
+        .ucmd()
+        .arg("-s")
+        .succeeds()
+        .stdout_contains_line("total 4");
+
+    scene
+        .ucmd()
+        .arg("-s")
+        .env("POSIXLY_CORRECT", "some_value")
+        .succeeds()
+        .stdout_contains_line("total 8");
+}
+
+#[test]
+fn test_ls_hyperlink() {
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    let file = "a.txt";
+
+    at.touch(file);
+
+    let path = at.root_dir_resolved();
+    let separator = std::path::MAIN_SEPARATOR_STR;
+
+    let result = scene.ucmd().arg("--hyperlink").succeeds();
+    assert!(result.stdout_str().contains("\x1b]8;;file://"));
+    assert!(result
+        .stdout_str()
+        .contains(&format!("{path}{separator}{file}\x07{file}\x1b]8;;\x07")));
+
+    let result = scene.ucmd().arg("--hyperlink=always").succeeds();
+    assert!(result.stdout_str().contains("\x1b]8;;file://"));
+    assert!(result
+        .stdout_str()
+        .contains(&format!("{path}{separator}{file}\x07{file}\x1b]8;;\x07")));
+
+    scene
+        .ucmd()
+        .arg("--hyperlink=never")
+        .succeeds()
+        .stdout_is(format!("{file}\n"));
 }
