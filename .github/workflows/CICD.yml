@@ -52,6 +52,9 @@ jobs:
           - { os: windows-latest , features: feat_os_windows }
     steps:
     - uses: actions/checkout@v4
+    - name: Setup build environment (Windows)
+      if: matrix.os == 'windows-latest'
+      uses: ./.github/actions/mingw-env
     - uses: dtolnay/rust-toolchain@nightly
     ## note: requires 'nightly' toolchain b/c `cargo-udeps` uses the `rustc` '-Z save-analysis' option
     ## * ... ref: <https://github.com/est31/cargo-udeps/issues/73>
@@ -302,6 +305,9 @@ jobs:
           - { os: windows-latest , features: feat_os_windows }
     steps:
     - uses: actions/checkout@v4
+    - name: Setup build environment (Windows)
+      if: matrix.os == 'windows-latest'
+      uses: ./.github/actions/mingw-env
     - uses: dtolnay/rust-toolchain@stable
     - uses: taiki-e/install-action@nextest
     - uses: Swatinem/rust-cache@v2
@@ -329,6 +335,9 @@ jobs:
           - { os: windows-latest , features: feat_os_windows }
     steps:
     - uses: actions/checkout@v4
+    - name: Setup build environment (Windows)
+      if: matrix.os == 'windows-latest'
+      uses: ./.github/actions/mingw-env
     - uses: dtolnay/rust-toolchain@nightly
     - uses: taiki-e/install-action@nextest
     - uses: Swatinem/rust-cache@v2
@@ -480,6 +489,9 @@ jobs:
           - { os: windows-latest , target: x86_64-pc-windows-msvc      , features: feat_os_windows }
     steps:
     - uses: actions/checkout@v4
+    - name: Setup build environment (Windows)
+      if: matrix.os == 'windows-latest'
+      uses: ./.github/actions/mingw-env
     - uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ env.RUST_MIN_SRV }}
@@ -903,6 +915,9 @@ jobs:
           - { os: windows-latest , features: windows, toolchain: nightly-x86_64-pc-windows-gnu }
     steps:
     - uses: actions/checkout@v4
+    - name: Setup build environment (Windows)
+      if: matrix.os == 'windows-latest'
+      uses: ./.github/actions/mingw-env
     - uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ matrix.job.toolchain }}
