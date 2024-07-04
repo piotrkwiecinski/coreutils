@@ -10,4 +10,3 @@ rustflags = [
     "-Wclippy::explicit_iter_loop",
     "-Wclippy::if_not_else",
 ]
-
